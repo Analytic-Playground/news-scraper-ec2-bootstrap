@@ -1,0 +1,23 @@
+# Secrets
+.env
+env/
+secrets*
+*.key
+*.pem
+credentials.json
+token.json
+
+# Runtime
+logs/
+output/
+data/
+nltk_data/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db
