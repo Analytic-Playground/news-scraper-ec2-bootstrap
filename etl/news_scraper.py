@@ -9,14 +9,15 @@ import socket # package for email retrieval timeout
 socket.setdefaulttimeout(60)
 import signal # package for python operation timeouts
 
-# connection for RDS db
-import psycopg2
-from psycopg2.extras import execute_values
-
 # data manipulation
 import pandas as pd
 import re
 from datetime import datetime, timedelta, timezone
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--full-refresh', action='store_true', help='Pull full Gmail history instead of last 3 days')
+args = parser.parse_args()
 
 # email packages
 from googleapiclient.discovery import build
@@ -35,7 +36,7 @@ from bs4 import BeautifulSoup
 import requests
 
 # graphs
-import plotly.express as px
+# import plotly.express as px
 import us
 
 # organize later
@@ -52,25 +53,37 @@ sys.stdout.flush()
 sys.path.append(os.path.join(BASE_DIR))
 from config.ban_config import state_patterns, keywords
 from config.news_scraper_functions import extract_state, extract_datasource, clean_headline, COMPILED_PATTERNS, extract_target_generic, find_keyword_targets, choose_target, safe_get_plain
+# imports for Gmail cutoff
+from datetime import datetime, timedelta, timezone
+# connect to email server and initial pull of messages and emails
 
-# connect to email server and initial pull of messages
-# initialize connection to server
-all_messages = []
-page_token = None
+def fetch_gmail_messages(full_refresh=False):
+    all_messages = []
+    page_token = None
+    
+    if full_refresh:
+        query = 'subject:"Google Alert - ban"'
+        print("Mode: FULL REFRESH - pulling complete Gmail history")
+    else:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y/%m/%d")
+        query = f'subject:"Google Alert - ban" after:{cutoff}'
+        print(f"Mode: INCREMENTAL - pulling from {cutoff}")
 
-while True:
-    response = service.users().messages().list(
-        userId="me",
-        q='subject:"Google Alert - ban"',
-        maxResults=500,
-        pageToken=page_token
-    ).execute()
+    while True:
+        response = service.users().messages().list(
+            userId="me",
+            q=query,
+            maxResults=500,
+            pageToken=page_token
+        ).execute()
+        all_messages.extend(response.get("messages", []))
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
 
-    all_messages.extend(response.get("messages", []))
-    page_token = response.get("nextPageToken")
+    return all_messages
 
-    if not page_token:
-        break
+all_messages = fetch_gmail_messages(full_refresh=args.full_refresh)
 
 print(f"Total messages found: {len(all_messages)}")
 
@@ -195,42 +208,6 @@ df["target"] = df["headlines"].apply(choose_target)
 df = df[['alert_date', 'state', 'target', 'headlines', 'datasource', 'article_links']].sort_values(by=['state', 'target']).drop_duplicates(subset=['article_links']).reset_index(drop=True)
 df['alert_date'] = pd.to_datetime(df['alert_date'], utc=True)
 
-# set up connection to db
-# print('connecting to db and updating...')
-# user = os.getenv("DB_USER")
-# password = os.getenv("DB_PASS")
-# host = os.getenv("DB_HOST")
-# database = os.getenv("DB_NAME")
-# port = int(os.getenv("DB_PORT"))
-# conn = psycopg2.connect(
-#    host=host,
-#    database=database,
-#    user=user,
-#    password=password,
-#    port=port
-#)
-
-# conn.autocommit = True
-# cur = conn.cursor()
-
-# Prepare the insert statement
-# insert_query = """
-# INSERT INTO etl_news (alert_date, state, target, headlines, datasource, article_links)
-# VALUES %s
-# ON CONFLICT (article_links) DO NOTHING;  -- avoid duplicates
-# """
-
-# Convert DataFrame to list of tuples
-# data_tuples = list(df.itertuples(index=False, name=None))
-
-# Execute bulk insert
-# execute_values(cur, insert_query, data_tuples)
-
-# cur.close()
-# conn.close()
-
-# print(f"{len(df)} rows inserted into etl_news!")
-
 
 # --- S3 JSON export ---
 print("Uploading JSON to S3...")
@@ -240,22 +217,54 @@ s3 = boto3.client(
     aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
     region_name=os.getenv("AWS_REGION")
 )
+# S3 cleanup for full refreshes only
+if args.full_refresh:
+    print("Full refresh: clearing existing S3 data...")
+    try:
+        s3.delete_object(
+            Bucket="krieger-technologies.com",
+            Key="news_data/public_news_detail_table.json"
+        )
+        print("Existing S3 data cleared.")
+    except Exception as e:
+        print(f"Nothing to clear or error: {e}")
+
+# -- MERGE WITH EXISTING S3 DATA --
+print("downloading existing detail JSON from S3 for merge...")
+try:
+    existing_obj = s3.get_object(
+            Bucket="krieger-technologies.com",
+            Key="news_data/public_news_detail_table.json"
+            )
+    existing_records = json.loads(existing_obj["Body"].read().decode("utf-8"))
+    df_existing = pd.DataFrame(existing_records)
+    print(f"Existing records loaded: {len(df_existing)}")
+except Exception as e:
+    print(f"No existing data found or error loading - starting fresh: {e}")
+    df_existing = pd.DataFrame()
 # Convert DataFrame dates to ISO format
-# print('full dataframe shape:',df.shape)
 # 1 drop "National / Unknown"
 df_filtered = df[df["state"] != "National / Unknown"]
-# print('filtered out national/unknown:',df_filtered.shape)
-# 2 drop headlines that begin with "<https"
+# 2 drop headlines that are parsed wrong and begin with an https tag
 df_filtered = df_filtered[~df_filtered["headlines"].str.startswith("<https", na=False)]
-# df_to_json = df_filtered.copy()
+df_filtered["state_abbrev"] = df_filtered["state"].apply(lambda x: us.states.lookup(x).abbr if us.states.lookup(x) else None)
 df_filtered['alert_date'] = df_filtered['alert_date'].dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-# print('final datframe shape:', df_filtered.shape)
+
+# --- APPEND TO EXISTING DATA ---
+if not df_existing.empty:
+    df_filtered = pd.concat([df_existing, df_filtered], ignore_index=True)
+    df_filtered = df_filtered.drop_duplicates(subset=["article_links"]).reset_index(drop=True)
+    print(f"Merged record count after dedup: {len(df_filtered)}")
+else:
+    print("No existing data to merge - using new records only")
 # --- DETAIL DATASET (row-level, authoritative) ---
+df_filtered = df_filtered.where(pd.notnull(df_filtered), None)
 detail_payload = (
     df_filtered[
         [
             "alert_date",
             "state",
+            "state_abbrev",
             "target",
             "headlines",
             "datasource",
@@ -266,14 +275,19 @@ detail_payload = (
     .to_dict(orient="records")
 )
 
-s3.put_object(
+resp_detail = s3.put_object(
     Bucket="krieger-technologies.com",
     Key="news_data/public_news_detail_table.json",
     Body=json.dumps(detail_payload, indent=2),
     ContentType="application/json",
 )
-
-# Build aggregated dataset for frontend
+print(
+    "DETAIL PUT:",
+    resp_detail.get("ResponseMetadata", {}).get("HTTPStatusCode"),
+    "ETag:",
+    resp_detail.get("ETag"),
+)
+# Build aggregated dataset for histogram
 summary_df = (
     df_filtered.groupby("target")
     .agg(
@@ -287,11 +301,17 @@ summary_df = (
 
 json_payload = summary_df.to_dict(orient="records")
 
-s3.put_object(
+resp_bar = s3.put_object(
     Bucket="krieger-technologies.com",
     Key="news_data/public_news_data_bar_chart.json",
     Body=json.dumps(json_payload, indent=2),
     ContentType="application/json",
+)
+print(
+    "BAR PUT:",
+    resp_bar.get("ResponseMetadata", {}).get("HTTPStatusCode"),
+    "ETag:",
+    resp_bar.get("ETag"),
 )
 # export last time run timestamp
 metadata = {
@@ -300,13 +320,19 @@ metadata = {
     "source": "email_scraper_v4"
 }
 
-s3.put_object(
+resp_meta = s3.put_object(
     Bucket="krieger-technologies.com",
     Key="news_data/last_run_timestamp.json",
     Body=json.dumps(metadata, indent=2),
     ContentType="application/json",
     CacheControl="no-cache, no-store, must-revalidate",
 )
+print(
+    "META PUT:",
+    resp_meta.get("ResponseMetadata", {}).get("HTTPStatusCode"),
+    "ETag:",
+    resp_meta.get("ETag"),
+)
 print("ETL reached end of script")
 sys.exit(0)
-print("✅ public_news_data.json uploaded")
+print("public_news_data.json uploaded")
